@@ -432,7 +432,7 @@ def main():
     app.add_handler(CallbackQueryHandler(alloc_cb, pattern=r"^alloc_"))
 
     # Push quest tiap hari jam 07:00 UTC (14:00 WIB)
-    app.job_queue.run_daily(daily_broadcast, time=time(hour=7, minute=0))
+    # app.job_queue.run_daily(daily_broadcast, time=time(hour=7, minute=0))
 
     print("⚔️ Bot Questism berjalan...", flush=True)
     app.run_polling()
