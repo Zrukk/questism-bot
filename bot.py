@@ -218,7 +218,7 @@ SHOP_ITEMS = {
         "price": 400, "cat": "bundle", "type": "instant"},
 }
 
-# ================== DB HELPERS ==================
+# ================== UTILS ==================
 def get_rank(total):
     for thresh, name in RANK_TABLE:
         if total >= thresh: return name
@@ -269,7 +269,8 @@ def init_db():
         last_login_date TEXT, login_streak INTEGER DEFAULT 0,
         total_quests INTEGER DEFAULT 0, badges TEXT DEFAULT '',
         last_penalty_date TEXT, in_penalty INTEGER DEFAULT 0,
-        current_quest_rank TEXT DEFAULT 'E')""")
+        current_quest_rank TEXT DEFAULT 'E',
+        last_attack_date TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS daily_quests (
         user_id INTEGER, quest_date TEXT, slot INTEGER,
         quest_rank TEXT, stat TEXT, quest_name TEXT,
@@ -309,6 +310,7 @@ def migrate_db():
         ("total_quests", "INTEGER DEFAULT 0"), ("badges", "TEXT DEFAULT ''"),
         ("last_penalty_date", "TEXT"), ("in_penalty", "INTEGER DEFAULT 0"),
         ("current_quest_rank", "TEXT DEFAULT 'E'"),
+        ("last_attack_date", "TEXT"),
     ]
     for col, typ in new_cols:
         if col not in existing:
@@ -335,7 +337,7 @@ def reset_user(uid):
         quest_completed=0, last_rest_week=NULL, streak=0,
         last_complete_date=NULL, last_login_date=NULL, login_streak=0,
         total_quests=0, badges='', last_penalty_date=NULL, in_penalty=0,
-        current_quest_rank='E' WHERE user_id=?""", (uid,))
+        current_quest_rank='E', last_attack_date=NULL WHERE user_id=?""", (uid,))
     c.execute("DELETE FROM boss_damage WHERE user_id=?", (uid,))
     c.execute("DELETE FROM daily_quests WHERE user_id=?", (uid,))
     c.execute("DELETE FROM purchases WHERE user_id=?", (uid,))
@@ -357,7 +359,7 @@ def add_exp_and_levelup(uid, amount):
               (level, exp, sp, uid))
     conn.commit(); conn.close()
     return leveled, level, sp
-    # ================== DAILY QUEST LOGIC ==================
+  # ================== DAILY QUEST LOGIC ==================
 def generate_daily_quests(uid):
     row = get_user(uid)
     if not row: return []
@@ -374,12 +376,10 @@ def generate_daily_quests(uid):
         for _try in range(20):
             if hidden_active or random.random() < 0.10:
                 qr, stat, (qname, qexp, qgain) = pick_hidden_quest(user_rank)
-                exp = qexp * 2; gain = qgain + 2
-                is_hidden = True
+                exp = qexp * 2; gain = qgain + 2; is_hidden = True
             else:
                 qr, stat, (qname, qexp, qgain) = pick_quest_for_rank(user_rank)
-                exp = qexp; gain = qgain
-                is_hidden = False
+                exp = qexp; gain = qgain; is_hidden = False
             if (stat, qname) not in used:
                 used.add((stat, qname)); break
         c.execute("""INSERT INTO daily_quests
@@ -775,7 +775,7 @@ def add_boss_damage(uid, dmg):
     hp, defeated = c.fetchone()
     conn.commit(); conn.close()
     return hp, defeated
-    # ================== RENDERERS ==================
+  # ================== RENDERERS ==================
 def render_quests_list(quests):
     done = sum(1 for q in quests if q["completed"])
     total = len(quests)
@@ -795,7 +795,6 @@ def render_quests_list(quests):
     return "\n".join(lines)
 
 def render_status_text(row):
-    uid = row[0]
     (_, username, level, exp, s, a, v, i, sp, *_r) = row
     total = s + a + v + i
     rank = get_rank(total)
@@ -833,15 +832,22 @@ def render_boss_text(uid):
     c.execute("""SELECT u.username, bd.damage FROM boss_damage bd
                  JOIN users u ON u.user_id=bd.user_id
                  WHERE bd.week=? ORDER BY bd.damage DESC LIMIT 5""", (week,))
-    top = c.fetchall(); conn.close()
+    top = c.fetchall()
+    c.execute("SELECT last_attack_date FROM users WHERE user_id=?", (uid,))
+    la = c.fetchone(); conn.close()
+    today = date.today().isoformat()
+    can_attack = not (la and la[0] == today)
     pct = int((hp / max_hp) * 100) if max_hp else 0
     filled = int((hp / max_hp) * 10) if max_hp else 0
     bar = "█" * filled + "░" * (10 - filled)
     status = "💀 <b>DIKALAHKAN</b>" if defeated else "⚔️ <b>MASIH HIDUP</b>"
+    cd_status = "✅ <b>Siap menyerang!</b>" if can_attack else "⏳ <b>Cooldown (reset 00:00)</b>"
     lines = [f"🐉 <b>WEEKLY BOSS RAID</b>", f"Minggu: {week}",
              "━━━━━━━━━━━━━━━━━━━", f"👹 <b>Raja Kegelapan</b>",
              f"❤️ HP: {hp}/{max_hp} ({pct}%)", f"   [{bar}]", f"{status}",
-             "━━━━━━━━━━━━━━━━━━━", f"⚔️ Damage kamu: <b>{my_dmg}</b>",
+             "━━━━━━━━━━━━━━━━━━━",
+             f"⚔️ Damage kamu: <b>{my_dmg}</b>",
+             f"🎯 Status: {cd_status}",
              "", "🏅 <b>Top Attackers:</b>"]
     if top:
         for idx, (u, d) in enumerate(top): lines.append(f"{idx+1}. {esc(u)} — {d} dmg")
@@ -984,7 +990,7 @@ async def help_cmd(update, context):
         "/shop — Buka shop Stars\n"
         "/inventory — Lihat inventory\n\n"
         "🐉 <b>BOSS RAID</b>\n"
-        "/boss — Info boss\n"
+        "/boss — Info boss (cooldown 1x/hari)\n"
         "/attack — Serang boss\n\n"
         "⚠️ /reset — Hapus progress\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1109,12 +1115,19 @@ async def attack(update, context):
 def do_attack_logic(uid):
     row = get_user(uid)
     if not row: return {"error": "Ketik /start dulu."}
+    today = date.today().isoformat()
+    last_attack = row[23] if len(row) > 23 else None
+    if last_attack == today:
+        return {"error": "⏳ Kamu sudah menyerang boss hari ini!\nCooldown reset jam 00:00."}
     week, hp, max_hp, defeated = get_or_spawn_boss()
     if defeated: return {"error": "💀 Boss minggu ini sudah kalah!"}
     total = row[4] + row[5] + row[6] + row[7]
     dmg = max(10, total // 4) + random.randint(10, 50)
     if has_active_boost(uid, "boost_boss"): dmg *= 2
     new_hp, defeated = add_boss_damage(uid, dmg)
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("UPDATE users SET last_attack_date=? WHERE user_id=?", (today, uid))
+    conn.commit(); conn.close()
     msg = f"⚔️ <b>ATTACK!</b>\n\n💥 Damage: <b>{dmg}</b>\n❤️ Boss HP: {new_hp}/{BOSS_BASE_HP}"
     if new_hp <= 0 and not defeated:
         conn = sqlite3.connect(DB); c = conn.cursor()
@@ -1125,6 +1138,7 @@ def do_attack_logic(uid):
         for a in attackers:
             add_exp_and_levelup(a, 500); unlock_badge(a, "boss_slayer")
         msg += "\n\n🎉 <b>BOSS DIKALAHKAN!</b> Semua dapat +500 EXP & 🐉!"
+    msg += "\n\n⏳ <i>Cooldown reset besok jam 00:00</i>"
     return {"text": msg}
 
 async def reset_cmd(update, context):
@@ -1177,7 +1191,7 @@ async def inventory_cmd(update, context):
         lines.append("<i>Inventory masih kosong.</i>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML",
                                      reply_markup=kb_shop_main())
-    # ================== MAIN CALLBACKS ==================
+  # ================== MAIN CALLBACKS ==================
 async def callback_handler(update, context):
     query = update.callback_query
     await query.answer()
@@ -1399,7 +1413,7 @@ def main():
             BotCommand("shop", "Buka shop Stars"),
             BotCommand("inventory", "Lihat inventory"),
             BotCommand("boss", "Info weekly boss"),
-            BotCommand("attack", "Serang boss"),
+            BotCommand("attack", "Serang boss (1x/hari)"),
             BotCommand("reset", "Reset progress (hati-hati!)"),
             BotCommand("help", "Panduan lengkap"),
         ])
