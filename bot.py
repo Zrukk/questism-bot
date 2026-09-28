@@ -3,7 +3,8 @@ import sqlite3
 import random
 import html
 from datetime import date, timedelta, time, datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                      BotCommand)
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ============ SETUP ============
@@ -15,8 +16,7 @@ DB = os.environ.get("DB_PATH", "questism.db")
 
 def esc(s): return html.escape(str(s))
 
-# ================== QUEST DATABASE (by Rank) ==================
-# Format: (nama_misi, exp, stat_gain)
+# ================== QUEST DB ==================
 QUEST_DB = {
     "E": {
         "STR": [("10 Push-up", 60, 2), ("15 Squat", 60, 2),
@@ -103,7 +103,6 @@ QUEST_DB = {
     },
 }
 
-# Bobot rank quest berdasarkan rank user
 USER_RANK_TO_QUEST_RANKS = {
     "F":   ["E", "E", "E", "D"],
     "E":   ["E", "D", "D", "D"],
@@ -207,8 +206,7 @@ def init_db():
         last_login_date TEXT, login_streak INTEGER DEFAULT 0,
         total_quests INTEGER DEFAULT 0, badges TEXT DEFAULT '',
         last_penalty_date TEXT, in_penalty INTEGER DEFAULT 0,
-        current_quest_rank TEXT DEFAULT 'E'
-    )""")
+        current_quest_rank TEXT DEFAULT 'E')""")
     c.execute("""CREATE TABLE IF NOT EXISTS boss_state (
         week TEXT PRIMARY KEY, hp INTEGER, max_hp INTEGER,
         defeated INTEGER DEFAULT 0)""")
@@ -252,6 +250,20 @@ def create_user(uid, username):
     conn.commit()
     conn.close()
 
+def reset_user(uid):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("""UPDATE users SET
+        level=1, exp=0, str=0, agi=0, vit=0, int=0, stat_points=0,
+        last_quest_date=NULL, current_quest=NULL, current_quest_stat=NULL,
+        quest_completed=0, last_rest_week=NULL, streak=0,
+        last_complete_date=NULL, last_login_date=NULL, login_streak=0,
+        total_quests=0, badges='', last_penalty_date=NULL, in_penalty=0,
+        current_quest_rank='E' WHERE user_id=?""", (uid,))
+    c.execute("DELETE FROM boss_damage WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
 def add_exp_and_levelup(uid, amount):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -270,7 +282,7 @@ def add_exp_and_levelup(uid, amount):
     conn.close()
     return leveled, level, sp
 
-# ================== HELPER FEATURES ==================
+# ================== HELPER ==================
 def check_daily_login(uid):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -334,8 +346,7 @@ def check_badges(uid, row):
     new_badges = []
     for key, ok in checks.items():
         if ok and key not in owned:
-            new_badges.append(key)
-            owned.add(key)
+            new_badges.append(key); owned.add(key)
     if new_badges:
         conn = sqlite3.connect(DB)
         c = conn.cursor()
@@ -400,7 +411,7 @@ def add_boss_damage(uid, dmg):
     conn.close()
     return hp, defeated
 
-# ================== CARD RENDERER ==================
+# ================== RENDERERS ==================
 def render_quest_card(quest_rank, stat, quest_name, exp_reward, stat_gain, is_hidden=False):
     icon = QUEST_RANK_ICONS.get(quest_rank, "❓")
     title = "🎰 HIDDEN QUEST" if is_hidden else "🎴 DAILY QUEST"
@@ -419,59 +430,8 @@ def render_quest_card(quest_rank, stat, quest_name, exp_reward, stat_gain, is_hi
         f"{line}</pre>"
     )
 
-# ================== HANDLERS ==================
-async def start(update, context):
-    u = update.effective_user
-    name = u.username or u.first_name or "Hunter"
-    create_user(u.id, name)
-    row = get_user(u.id)
-
-    msgs = []
-    login_msg = check_daily_login(u.id)
-    if login_msg: msgs.append(login_msg)
-    penalty_msg = check_penalty(u.id, row)
-    if penalty_msg: msgs.append(penalty_msg)
-
-    welcome = (
-        f"⚔️ <b>Selamat datang, Hunter {esc(name)}!</b>\n\n"
-        "Sistem Questism aktif. Naikkan rank <b>F</b> → <b>SSS</b>!\n\n"
-        "📜 <b>Commands:</b>\n"
-        "/status • /quest • /complete\n"
-        "/randomquest • /rest • /allocate\n"
-        "/rank • /badges • /boss • /attack\n"
-        "/help – Bantuan lengkap"
-    )
-    if msgs:
-        welcome = "\n\n".join(msgs) + "\n\n" + welcome
-    await update.message.reply_text(welcome, parse_mode="HTML")
-
-async def help_cmd(update, context):
-    await update.message.reply_text(
-        "📖 <b>Cara Main</b>\n\n"
-        "1. /quest tiap hari → dapat quest <b>sesuai rank kamu</b>.\n"
-        "2. Kerjakan, lalu /complete untuk klaim EXP + stat.\n"
-        "3. Naik level → +5 stat point → /allocate.\n"
-        "4. Total stats menentukan Rank (F → SSS).\n"
-        "5. Makin tinggi rank → quest makin berat & reward besar.\n"
-        "6. /attack boss tiap hari buat bonus EXP.\n"
-        "7. ⚠️ Bolos 4+ hari = <b>Penalty Zone</b>.\n\n"
-        "🎴 Quest punya rank: E → D → C → B → A → S → SS → SSS",
-        parse_mode="HTML")
-
-async def status(update, context):
-    uid = update.effective_user.id
-    row = get_user(uid)
-    if not row:
-        await update.message.reply_text("Ketik /start dulu ya."); return
-
-    msgs = []
-    login_msg = check_daily_login(uid)
-    if login_msg: msgs.append(login_msg)
-    penalty_msg = check_penalty(uid, row)
-    if penalty_msg: msgs.append(penalty_msg)
-
-    row = get_user(uid)
-    (_, username, level, exp, s, a, v, i, sp, *_) = row
+def render_status_text(row):
+    (_, username, level, exp, s, a, v, i, sp, *_rest) = row
     total = s + a + v + i
     rank = get_rank(total)
     need = exp_needed(level)
@@ -482,7 +442,7 @@ async def status(update, context):
     penalty_label = " ⚠️ <b>PENALTY</b>" if in_penalty else ""
     allowed_ranks = sorted(set(USER_RANK_TO_QUEST_RANKS.get(rank, ["E"])))
 
-    text = (
+    return (
         f"📊 <b>STATUS HUNTER</b>{penalty_label}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"👤 {esc(username)}\n"
@@ -499,10 +459,134 @@ async def status(update, context):
         f"🎯 Stat Points: <b>{sp}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🎴 Quest rank tersedia: {' • '.join(allowed_ranks)}"
+)
+    # ================== KEYBOARDS ==================
+def kb_quest_card():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Selesai", callback_data="do_complete"),
+         InlineKeyboardButton("📊 Status", callback_data="view_status")],
+    ])
+
+def kb_after_complete():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Status", callback_data="view_status"),
+         InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc")],
+        [InlineKeyboardButton("🎲 Random Quest", callback_data="view_randomquest"),
+         InlineKeyboardButton("🐉 Boss Raid", callback_data="view_boss")],
+    ])
+
+def kb_status():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎴 Quest", callback_data="view_quest"),
+         InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc")],
+        [InlineKeyboardButton("🏆 Badge", callback_data="view_badges"),
+         InlineKeyboardButton("🐉 Boss", callback_data="view_boss")],
+    ])
+
+def kb_alloc():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💪 STR +1", callback_data="alloc_STR"),
+         InlineKeyboardButton("🏃 AGI +1", callback_data="alloc_AGI")],
+        [InlineKeyboardButton("❤️ VIT +1", callback_data="alloc_VIT"),
+         InlineKeyboardButton("🧠 INT +1", callback_data="alloc_INT")],
+        [InlineKeyboardButton("📊 Status", callback_data="view_status")],
+    ])
+
+def kb_reset_confirm():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ Ya, Reset Semua", callback_data="do_reset"),
+         InlineKeyboardButton("❌ Batal", callback_data="cancel_reset")],
+    ])
+
+def kb_boss():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚔️ Attack Boss", callback_data="do_attack"),
+         InlineKeyboardButton("📊 Status", callback_data="view_status")],
+    ])
+
+def kb_back():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Status", callback_data="view_status"),
+         InlineKeyboardButton("🎴 Quest", callback_data="view_quest")],
+    ])
+
+async def safe_edit(query, text, keyboard=None):
+    try:
+        await query.edit_message_text(text, parse_mode="HTML",
+                                       reply_markup=keyboard,
+                                       disable_web_page_preview=True)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML",
+                                        reply_markup=keyboard,
+                                        disable_web_page_preview=True)
+
+# ================== COMMANDS ==================
+async def start(update, context):
+    u = update.effective_user
+    name = u.username or u.first_name or "Hunter"
+    create_user(u.id, name)
+    row = get_user(u.id)
+
+    msgs = []
+    login_msg = check_daily_login(u.id)
+    if login_msg: msgs.append(login_msg)
+    penalty_msg = check_penalty(u.id, row)
+    if penalty_msg: msgs.append(penalty_msg)
+
+    welcome = (
+        f"⚔️ <b>Selamat datang, Hunter {esc(name)}!</b>\n\n"
+        "Sistem Questism aktif. Naikkan rank <b>F</b> → <b>SSS</b>!\n\n"
+        "💡 <i>Ketik / untuk lihat semua command</i>\n"
+        "📌 Mulai dari /quest atau cek /status"
     )
     if msgs:
+        welcome = "\n\n".join(msgs) + "\n\n" + welcome
+    await update.message.reply_text(welcome, parse_mode="HTML",
+                                     reply_markup=kb_status())
+
+async def help_cmd(update, context):
+    text = (
+        "⚔️ <b>QUESTISM BOT — COMMAND CENTER</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 <b>QUEST</b>\n"
+        "/quest — Ambil quest harian\n"
+        "/complete — Selesaikan (atau tap tombol ✅)\n"
+        "/randomquest — Quest bonus random\n"
+        "/rest — Rest day (1x/minggu)\n\n"
+        "📊 <b>PROGRESS</b>\n"
+        "/status — Stats, rank, level, badge\n"
+        "/rank — Leaderboard hunter\n"
+        "/badges — Koleksi badge\n"
+        "/allocate — Pakai stat point\n\n"
+        "🐉 <b>BOSS RAID</b>\n"
+        "/boss — Info boss minggu ini\n"
+        "/attack — Serang boss\n\n"
+        "⚠️ <b>LAINNYA</b>\n"
+        "/reset — Reset semua progress\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Ketik / untuk lihat menu command</i>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML",
+                                     reply_markup=kb_status())
+
+async def status(update, context):
+    uid = update.effective_user.id
+    row = get_user(uid)
+    if not row:
+        await update.message.reply_text("Ketik /start dulu ya."); return
+
+    msgs = []
+    login_msg = check_daily_login(uid)
+    if login_msg: msgs.append(login_msg)
+    penalty_msg = check_penalty(uid, row)
+    if penalty_msg: msgs.append(penalty_msg)
+
+    row = get_user(uid)
+    text = render_status_text(row)
+    if msgs:
         text = "\n\n".join(msgs) + "\n\n" + text
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML",
+                                     reply_markup=kb_status())
 
 async def quest(update, context):
     uid = update.effective_user.id
@@ -521,14 +605,15 @@ async def quest(update, context):
     if lqd == today:
         if qc:
             await update.message.reply_text(
-                "✅ Quest hari ini selesai! Coba /randomquest atau /attack.")
+                "✅ Quest hari ini selesai!\nCoba Random Quest atau Attack Boss.",
+                reply_markup=kb_after_complete())
         else:
             quest_rank = row[22] if len(row) > 22 else "E"
             exp_r, gain_r = find_quest_reward(quest_rank, cqs, cq)
             card = render_quest_card(quest_rank, cqs, cq, exp_r, gain_r)
             await update.message.reply_text(
-                card + "\n\nKetik /complete kalau sudah selesai.",
-                parse_mode="HTML")
+                card + "\n\nTap tombol ✅ kalau sudah selesai!",
+                parse_mode="HTML", reply_markup=kb_quest_card())
         return
 
     total_stats = row[4] + row[5] + row[6] + row[7]
@@ -554,27 +639,36 @@ async def quest(update, context):
     conn.close()
 
     card = render_quest_card(quest_rank, stat, qname, exp_reward, stat_gain, is_hidden)
-    footer = "\n\nSelesaikan dengan /complete." if not is_hidden else "\n\n⚡ Hidden Quest 2x reward! Selesaikan /complete."
-    await update.message.reply_text(card + footer, parse_mode="HTML")
+    footer = "\n\nTap tombol ✅ kalau sudah selesai!"
+    if is_hidden:
+        footer = "\n\n⚡ <b>Hidden Quest 2x reward!</b> Tap ✅ untuk klaim."
+    await update.message.reply_text(card + footer, parse_mode="HTML",
+                                     reply_markup=kb_quest_card())
 
 async def complete(update, context):
     uid = update.effective_user.id
+    result = do_complete_logic(uid)
+    if result["error"]:
+        await update.message.reply_text(result["error"]); return
+    await update.message.reply_text(result["text"], parse_mode="HTML",
+                                     reply_markup=kb_after_complete())
+
+def do_complete_logic(uid):
     row = get_user(uid)
     if not row:
-        await update.message.reply_text("Ketik /start dulu."); return
+        return {"error": "Ketik /start dulu.", "text": None}
 
     today = date.today().isoformat()
     lqd, cq, cqs, qc = row[9], row[10], row[11], row[12]
     quest_rank = row[22] if len(row) > 22 else "E"
 
     if lqd != today or not cq:
-        await update.message.reply_text("❌ Belum ada quest. Ketik /quest."); return
+        return {"error": "❌ Belum ada quest. Ketik /quest dulu.", "text": None}
     if qc:
-        await update.message.reply_text("✅ Sudah selesai."); return
+        return {"error": "✅ Quest ini sudah kamu selesaikan hari ini.", "text": None}
 
-    # Cari reward
     exp_r, gain_r = find_quest_reward(quest_rank, cqs, cq)
-    is_hidden = exp_r >= 150 and gain_r >= 4  # heuristik
+    is_hidden = exp_r >= 150 and gain_r >= 4
 
     streak = row[14]
     lcd = row[15]
@@ -617,8 +711,7 @@ async def complete(update, context):
     row2 = get_user(uid)
     new_badges = check_badges(uid, row2)
     msg += format_badge_msg(new_badges)
-
-    await update.message.reply_text(msg, parse_mode="HTML")
+    return {"error": None, "text": msg}
 
 async def random_quest(update, context):
     uid = update.effective_user.id
@@ -637,7 +730,8 @@ async def random_quest(update, context):
         msg += f"\n\n⬆️ <b>LEVEL UP!</b> Level {new_level} (+5 stat point)"
         row2 = get_user(uid)
         msg += format_badge_msg(check_badges(uid, row2))
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text(msg, parse_mode="HTML",
+                                     reply_markup=kb_after_complete())
 
 async def rest(update, context):
     uid = update.effective_user.id
@@ -656,48 +750,19 @@ async def rest(update, context):
     conn.commit()
     conn.close()
     await update.message.reply_text(
-        "😴 <b>REST DAY</b>\n\nHari ini bebas. Streak aman! 💪", parse_mode="HTML")
-
-def alloc_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💪 STR +1", callback_data="alloc_STR"),
-         InlineKeyboardButton("🏃 AGI +1", callback_data="alloc_AGI")],
-        [InlineKeyboardButton("❤️ VIT +1", callback_data="alloc_VIT"),
-         InlineKeyboardButton("🧠 INT +1", callback_data="alloc_INT")]])
+        "😴 <b>REST DAY</b>\n\nHari ini bebas. Streak aman! 💪",
+        parse_mode="HTML", reply_markup=kb_after_complete())
 
 async def allocate(update, context):
     row = get_user(update.effective_user.id)
     if not row:
         await update.message.reply_text("Ketik /start dulu."); return
     if row[8] <= 0:
-        await update.message.reply_text("❌ Gak punya stat point."); return
+        await update.message.reply_text("❌ Gak punya stat point. Naikkan level dulu!");
+        return
     await update.message.reply_text(
-        f"🎯 Stat Points: <b>{row[8]}</b>\nPilih stat:", parse_mode="HTML",
-        reply_markup=alloc_keyboard())
-
-async def alloc_cb(update, context):
-    q = update.callback_query
-    await q.answer()
-    stat = q.data.split("_", 1)[1]
-    if stat not in ("STR", "AGI", "VIT", "INT"): return
-    uid = q.from_user.id
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT stat_points FROM users WHERE user_id=?", (uid,))
-    r = c.fetchone()
-    if not r or r[0] <= 0:
-        await q.edit_message_text("❌ Habis."); conn.close(); return
-    c.execute(f"UPDATE users SET stat_points=stat_points-1, "
-              f"{stat.lower()}={stat.lower()}+1 WHERE user_id=?", (uid,))
-    conn.commit()
-    c.execute("SELECT stat_points FROM users WHERE user_id=?", (uid,))
-    new_sp = c.fetchone()[0]
-    conn.close()
-    if new_sp <= 0:
-        await q.edit_message_text(f"✅ +1 {stat}. Habis.")
-    else:
-        await q.edit_message_text(f"✅ +1 {stat}. Sisa: <b>{new_sp}</b>",
-            parse_mode="HTML", reply_markup=alloc_keyboard())
+        f"🎯 Stat Points: <b>{row[8]}</b>\nPilih stat yang mau dinaikkan:",
+        parse_mode="HTML", reply_markup=kb_alloc())
 
 async def rank_cmd(update, context):
     conn = sqlite3.connect(DB)
@@ -728,12 +793,18 @@ async def badges_cmd(update, context):
             lines.append(f"✅ {emoji} <b>{name}</b> — {desc}")
         else:
             lines.append(f"🔒 ??? — <i>tersembunyi</i>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                     reply_markup=kb_back())
 
 async def boss_cmd(update, context):
     uid = update.effective_user.id
     if not get_user(uid):
         await update.message.reply_text("Ketik /start dulu."); return
+    text = render_boss_text(uid)
+    await update.message.reply_text(text, parse_mode="HTML",
+                                     reply_markup=kb_boss())
+
+def render_boss_text(uid):
     week, hp, max_hp, defeated = get_or_spawn_boss()
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -765,20 +836,23 @@ async def boss_cmd(update, context):
             lines.append(f"{idx+1}. {esc(uname)} — {dmg} dmg")
     else:
         lines.append("<i>Belum ada yang nyerang</i>")
-    lines.append("")
-    lines.append("Ketik /attack untuk serang!")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    return "\n".join(lines)
 
 async def attack(update, context):
     uid = update.effective_user.id
+    result = do_attack_logic(uid)
+    if result.get("error"):
+        await update.message.reply_text(result["error"]); return
+    await update.message.reply_text(result["text"], parse_mode="HTML",
+                                     reply_markup=kb_boss())
+
+def do_attack_logic(uid):
     row = get_user(uid)
     if not row:
-        await update.message.reply_text("Ketik /start dulu."); return
-
+        return {"error": "Ketik /start dulu."}
     week, hp, max_hp, defeated = get_or_spawn_boss()
     if defeated:
-        await update.message.reply_text("💀 Boss minggu ini sudah kalah! Boss baru Senin depan.")
-        return
+        return {"error": "💀 Boss minggu ini sudah kalah! Boss baru Senin depan."}
 
     total = row[4] + row[5] + row[6] + row[7]
     base_dmg = max(10, total // 4)
@@ -806,9 +880,201 @@ async def attack(update, context):
             add_exp_and_levelup(a_uid, 500)
             unlock_badge(a_uid, "boss_slayer")
         msg += f"\n\n🎉 <b>BOSS DIKALAHKAN!</b>\nSemua penyerang dapat <b>+500 EXP</b> & badge 🐉!"
+    return {"text": msg}
 
-    await update.message.reply_text(msg, parse_mode="HTML")
+async def reset_cmd(update, context):
+    await update.message.reply_text(
+        "⚠️ <b>KONFIRMASI RESET</b>\n\n"
+        "Kamu akan <b>menghapus SEMUA progress</b>:\n"
+        "• Level, EXP, Stats\n"
+        "• Badge yang sudah dikumpulkan\n"
+        "• Streak & riwayat quest\n"
+        "• Damage boss\n\n"
+        "<b>⚠️ Tindakan ini tidak bisa dibatalkan!</b>",
+        parse_mode="HTML", reply_markup=kb_reset_confirm())
 
+# ================== CALLBACK HANDLERS ==================
+async def callback_handler(update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    uid = query.from_user.id
+
+    if data == "do_complete":
+        result = do_complete_logic(uid)
+        if result["error"]:
+            await query.answer(result["error"], show_alert=True)
+            return
+        await safe_edit(query, result["text"], kb_after_complete())
+        return
+
+    if data == "view_status":
+        row = get_user(uid)
+        if not row:
+            await safe_edit(query, "Ketik /start dulu."); return
+        text = render_status_text(row)
+        await safe_edit(query, text, kb_status())
+        return
+
+    if data == "view_quest":
+        row = get_user(uid)
+        if not row:
+            await safe_edit(query, "Ketik /start dulu."); return
+        today = date.today().isoformat()
+        lqd, cq, cqs, qc = row[9], row[10], row[11], row[12]
+        if lqd == today and cq:
+            if qc:
+                await safe_edit(query,
+                    "✅ Quest hari ini selesai!\nCoba Random Quest atau Attack Boss.",
+                    kb_after_complete())
+            else:
+                quest_rank = row[22] if len(row) > 22 else "E"
+                exp_r, gain_r = find_quest_reward(quest_rank, cqs, cq)
+                card = render_quest_card(quest_rank, cqs, cq, exp_r, gain_r)
+                await safe_edit(query,
+                    card + "\n\nTap tombol ✅ kalau sudah selesai!",
+                    kb_quest_card())
+        else:
+            await safe_edit(query,
+                "📜 Belum ada quest hari ini.\nKetik /quest untuk mengambil!",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎴 Ambil Quest", callback_data="do_quest")
+                ]]))
+        return
+
+    if data == "do_quest":
+        row = get_user(uid)
+        if not row:
+            await safe_edit(query, "Ketik /start dulu."); return
+        today = date.today().isoformat()
+        if row[9] == today and row[10]:
+            await query.answer("Kamu sudah punya quest hari ini!", show_alert=True)
+            return
+        total_stats = row[4] + row[5] + row[6] + row[7]
+        user_rank = get_rank(total_stats)
+        is_hidden = random.random() < 0.10
+        if is_hidden:
+            quest_rank, stat, (qname, qexp, qgain) = pick_hidden_quest(user_rank)
+            exp_reward = qexp * 2
+            stat_gain = qgain + 2
+        else:
+            quest_rank, stat, (qname, qexp, qgain) = pick_quest_for_rank(user_rank)
+            exp_reward = qexp
+            stat_gain = qgain
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("""UPDATE users SET last_quest_date=?, current_quest=?,
+                     current_quest_stat=?, quest_completed=0,
+                     current_quest_rank=? WHERE user_id=?""",
+                  (today, qname, stat, quest_rank, uid))
+        conn.commit()
+        conn.close()
+        card = render_quest_card(quest_rank, stat, qname, exp_reward, stat_gain, is_hidden)
+        footer = "\n\nTap tombol ✅ kalau sudah selesai!"
+        if is_hidden:
+            footer = "\n\n⚡ <b>Hidden Quest 2x reward!</b> Tap ✅ untuk klaim."
+        await safe_edit(query, card + footer, kb_quest_card())
+        return
+
+    if data == "view_alloc":
+        row = get_user(uid)
+        if not row:
+            await safe_edit(query, "Ketik /start dulu."); return
+        if row[8] <= 0:
+            await safe_edit(query,
+                "❌ Kamu belum punya stat point.\nNaikkan level dengan quest dulu!",
+                kb_back())
+            return
+        await safe_edit(query,
+            f"🎯 Stat Points: <b>{row[8]}</b>\nPilih stat yang mau dinaikkan:",
+            kb_alloc())
+        return
+
+    if data.startswith("alloc_"):
+        stat = data.split("_", 1)[1]
+        if stat not in ("STR", "AGI", "VIT", "INT"): return
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("SELECT stat_points FROM users WHERE user_id=?", (uid,))
+        r = c.fetchone()
+        if not r or r[0] <= 0:
+            await safe_edit(query, "❌ Stat point habis.", kb_back())
+            conn.close(); return
+        c.execute(f"UPDATE users SET stat_points=stat_points-1, "
+                  f"{stat.lower()}={stat.lower()}+1 WHERE user_id=?", (uid,))
+        conn.commit()
+        c.execute("SELECT stat_points FROM users WHERE user_id=?", (uid,))
+        new_sp = c.fetchone()[0]
+        conn.close()
+        if new_sp <= 0:
+            await safe_edit(query, f"✅ +1 {stat}. Stat point habis.", kb_back())
+        else:
+            await safe_edit(query,
+                f"✅ +1 {stat}!\n🎯 Sisa Stat Points: <b>{new_sp}</b>\n\nPilih lagi:",
+                kb_alloc())
+        return
+
+    if data == "view_badges":
+        row = get_user(uid)
+        if not row:
+            await safe_edit(query, "Ketik /start dulu."); return
+        owned = set((row[19] or "").split(",")) - {""} if len(row) > 19 else set()
+        lines = [f"🏆 <b>KOLEKSI BADGE</b> ({len(owned)}/{len(BADGES)})",
+                 "━━━━━━━━━━━━━━━━━━━"]
+        for key, (emoji, name, desc) in BADGES.items():
+            if key in owned:
+                lines.append(f"✅ {emoji} <b>{name}</b> — {desc}")
+            else:
+                lines.append(f"🔒 ??? — <i>tersembunyi</i>")
+        await safe_edit(query, "\n".join(lines), kb_back())
+        return
+
+    if data == "view_boss":
+        text = render_boss_text(uid)
+        await safe_edit(query, text, kb_boss())
+        return
+
+    if data == "do_attack":
+        result = do_attack_logic(uid)
+        if result.get("error"):
+            await query.answer(result["error"], show_alert=True)
+            return
+        await safe_edit(query, result["text"], kb_boss())
+        return
+
+    if data == "view_randomquest":
+        qtext, stat, reward = random.choice(RANDOM_QUESTS)
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute(f"UPDATE users SET {stat.lower()}={stat.lower()}+1 WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+        leveled, new_level, sp = add_exp_and_levelup(uid, reward)
+        msg = f"🎲 <b>RANDOM QUEST</b>\n🎯 {esc(qtext)}\n💎 +{reward} EXP, +1 {stat}"
+        if leveled:
+            msg += f"\n\n⬆️ <b>LEVEL UP!</b> Level {new_level} (+5 stat point)"
+            row2 = get_user(uid)
+            msg += format_badge_msg(check_badges(uid, row2))
+        await safe_edit(query, msg, kb_after_complete())
+        return
+
+    if data == "do_reset":
+        reset_user(uid)
+        await safe_edit(query,
+            "✅ <b>RESET BERHASIL!</b>\n\n"
+            "Semua progress kamu sudah dihapus.\n"
+            "Ketik /quest untuk memulai petualangan baru! ⚔️",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎴 Mulai Quest", callback_data="do_quest"),
+                InlineKeyboardButton("📊 Status", callback_data="view_status")
+            ]]))
+        return
+
+    if data == "cancel_reset":
+        await safe_edit(query, "❌ Reset dibatalkan. Progress kamu aman!", kb_status())
+        return
+
+# ================== DAILY BROADCAST ==================
 async def daily_broadcast(context):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -820,7 +1086,10 @@ async def daily_broadcast(context):
             await context.bot.send_message(
                 chat_id=uid,
                 text="🌅 <b>Quest baru tersedia!</b>\nKetik /quest untuk ambil misi.",
-                parse_mode="HTML")
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎴 Ambil Quest", callback_data="do_quest")
+                ]]))
         except Exception:
             pass
 
@@ -841,7 +1110,27 @@ def main():
     app.add_handler(CommandHandler("badges", badges_cmd))
     app.add_handler(CommandHandler("boss", boss_cmd))
     app.add_handler(CommandHandler("attack", attack))
-    app.add_handler(CallbackQueryHandler(alloc_cb, pattern=r"^alloc_"))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            BotCommand("start", "Mulai & dapat daily login bonus"),
+            BotCommand("status", "Lihat stats, rank, level, badge"),
+            BotCommand("quest", "Ambil quest harian sesuai rank"),
+            BotCommand("complete", "Selesaikan quest hari ini"),
+            BotCommand("randomquest", "Quest bonus random"),
+            BotCommand("rest", "Rest day (1x per minggu)"),
+            BotCommand("allocate", "Pakai stat point"),
+            BotCommand("rank", "Leaderboard hunter terkuat"),
+            BotCommand("badges", "Koleksi badge kamu"),
+            BotCommand("boss", "Info weekly boss raid"),
+            BotCommand("attack", "Serang boss untuk bonus EXP"),
+            BotCommand("reset", "Reset semua progress (hati-hati!)"),
+            BotCommand("help", "Panduan lengkap cara main"),
+        ])
+
+    app.post_init = post_init
 
     try:
         app.job_queue.run_daily(daily_broadcast, time=time(hour=7, minute=0))
