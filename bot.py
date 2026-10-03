@@ -17,6 +17,10 @@ DB = os.environ.get("DB_PATH", "questism.db")
 
 def esc(s): return html.escape(str(s))
 
+# ================== KONFIGURASI IKLAN ==================
+MONETAG_URL = "https://omg10.com/4/11851378"
+AD_REWARD_EXP = 50
+
 # ================== QUEST DB ==================
 QUEST_DB = {
     "E": {
@@ -149,6 +153,7 @@ BADGES = {
     "perfect_day": ("✨", "Sempurna", "Selesaikan semua quest sehari"),
     "shopper": ("🛍️", "Shopper", "Pertama kali beli di shop"),
     "whale": ("🐳", "Whale", "Beli 10+ item di shop"),
+    "ad_watcher": ("📺", "Penonton Setia", "Tonton iklan 10x"),
 }
 
 BOSS_BASE_HP = 5000
@@ -177,7 +182,6 @@ SHOP_ITEMS = {
         "price": 120, "cat": "cosmetic", "type": "permanent"},
     "emoji_pack":    {"name": "✨ Animated Emoji", "desc": "Unlock emoji animasi",
         "price": 80, "cat": "cosmetic", "type": "permanent"},
-
     "boost_exp2x":   {"name": "🔥 2x EXP (24 jam)", "desc": "EXP 2x lipat 24 jam",
         "price": 40, "cat": "boost", "type": "timed", "hours": 24},
     "boost_stat2x":  {"name": "🎯 2x Stat (24 jam)", "desc": "Stat gain 2x lipat 24 jam",
@@ -188,7 +192,6 @@ SHOP_ITEMS = {
         "price": 60, "cat": "boost", "type": "timed", "hours": 168},
     "boost_login":   {"name": "💰 3x Login Bonus (7h)", "desc": "Login bonus 3x 7 hari",
         "price": 45, "cat": "boost", "type": "timed", "hours": 168},
-
     "qol_reroll":    {"name": "🔄 Reroll Quest", "desc": "Ganti quest harian",
         "price": 15, "cat": "qol", "type": "instant"},
     "qol_shield":    {"name": "🛡️ Streak Shield", "desc": "Proteksi streak 1 hari",
@@ -199,14 +202,12 @@ SHOP_ITEMS = {
         "price": 20, "cat": "qol", "type": "instant"},
     "qol_extra_quest": {"name": "🎯 Extra Quest", "desc": "+1 slot quest hari ini",
         "price": 35, "cat": "qol", "type": "instant"},
-
     "gacha_common":  {"name": "📦 Common Box", "desc": "Reward random biasa",
         "price": 20, "cat": "gacha", "type": "instant"},
     "gacha_rare":    {"name": "🎁 Rare Box", "desc": "Reward random bagus",
         "price": 80, "cat": "gacha", "type": "instant"},
     "gacha_legend":  {"name": "💎 Legendary Box", "desc": "Dijamin item terbaik!",
         "price": 250, "cat": "gacha", "type": "instant"},
-
     "bundle_starter": {"name": "🎒 Starter Pack",
         "desc": "2x EXP 24j + Common Box + Reroll",
         "price": 60, "cat": "bundle", "type": "instant"},
@@ -298,6 +299,10 @@ def init_db():
         PRIMARY KEY (user_id, item_id))""")
     c.execute("""CREATE TABLE IF NOT EXISTS user_title (
         user_id INTEGER PRIMARY KEY, title TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS user_ads (
+        user_id INTEGER PRIMARY KEY,
+        last_ad_date TEXT,
+        total_ads INTEGER DEFAULT 0)""")
     conn.commit(); conn.close()
     migrate_db()
 
@@ -345,6 +350,7 @@ def reset_user(uid):
     c.execute("DELETE FROM user_boosts WHERE user_id=?", (uid,))
     c.execute("DELETE FROM user_inventory WHERE user_id=?", (uid,))
     c.execute("DELETE FROM user_title WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM user_ads WHERE user_id=?", (uid,))
     conn.commit(); conn.close()
 
 def add_exp_and_levelup(uid, amount):
@@ -535,7 +541,11 @@ def check_badges(uid, row):
     total_quests = row[18] if len(row) > 18 else 0
     conn = sqlite3.connect(DB); c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM purchases WHERE user_id=?", (uid,))
-    purchases = c.fetchone()[0]; conn.close()
+    purchases = c.fetchone()[0]
+    c.execute("SELECT total_ads FROM user_ads WHERE user_id=?", (uid,))
+    ads_row = c.fetchone()
+    total_ads = ads_row[0] if ads_row else 0
+    conn.close()
     checks = {
         "first_quest": total_quests >= 1,
         "streak_7": row[14] >= 7, "streak_30": row[14] >= 30,
@@ -545,6 +555,7 @@ def check_badges(uid, row):
         "rank_ss": total_stats >= 750, "rank_sss": total_stats >= 1000,
         "quest_50": total_quests >= 50, "quest_100": total_quests >= 100,
         "shopper": purchases >= 1, "whale": purchases >= 10,
+        "ad_watcher": total_ads >= 10,
     }
     new_badges = []
     for k, ok in checks.items():
@@ -775,7 +786,16 @@ def add_boss_damage(uid, dmg):
     hp, defeated = c.fetchone()
     conn.commit(); conn.close()
     return hp, defeated
-  # ================== RENDERERS ==================
+
+# ================== IKLAN MONETAG ==================
+def check_ad_reward(uid):
+    """Cek apakah user bisa klaim reward iklan (1x per hari)."""
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("SELECT last_ad_date FROM user_ads WHERE user_id=?", (uid,))
+    row = c.fetchone()
+    today = date.today().isoformat()
+    if row and row[0] == today:
+      # ================== RENDERERS ==================
 def render_quests_list(quests):
     done = sum(1 for q in quests if q["completed"])
     total = len(quests)
@@ -878,22 +898,24 @@ def kb_quests_list(quests):
 
 def kb_after_complete():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎴 Quest", callback_data="view_quest"),
-         InlineKeyboardButton("📊 Status", callback_data="view_status")],
-        [InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc"),
-         InlineKeyboardButton("🥇 Rank", callback_data="view_rank")],
-        [InlineKeyboardButton("🐉 Boss", callback_data="view_boss"),
-         InlineKeyboardButton("⭐ Shop", callback_data="shop_back")],
+        [InlineKeyboardButton("🎬 Tonton Iklan +EXP", callback_data="watch_ad"),
+         InlineKeyboardButton("🎴 Quest", callback_data="view_quest")],
+        [InlineKeyboardButton("📊 Status", callback_data="view_status"),
+         InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc")],
+        [InlineKeyboardButton("🥇 Rank", callback_data="view_rank"),
+         InlineKeyboardButton("🐉 Boss", callback_data="view_boss")],
+        [InlineKeyboardButton("⭐ Shop", callback_data="shop_back")],
     ])
 
 def kb_status():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎴 Quest", callback_data="view_quest"),
-         InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc"),
+        [InlineKeyboardButton("🎬 Tonton Iklan +EXP", callback_data="watch_ad"),
+         InlineKeyboardButton("🎴 Quest", callback_data="view_quest")],
+        [InlineKeyboardButton("🎯 Allocate", callback_data="view_alloc"),
          InlineKeyboardButton("🥇 Rank", callback_data="view_rank")],
         [InlineKeyboardButton("🏆 Badge", callback_data="view_badges"),
-         InlineKeyboardButton("🐉 Boss", callback_data="view_boss"),
-         InlineKeyboardButton("⭐ Shop", callback_data="shop_back")],
+         InlineKeyboardButton("🐉 Boss", callback_data="view_boss")],
+        [InlineKeyboardButton("⭐ Shop", callback_data="shop_back")],
     ])
 
 def kb_alloc():
@@ -942,6 +964,13 @@ def kb_shop_items(cat):
     rows.append([InlineKeyboardButton("⬅️ Kembali", callback_data="shop_back")])
     return InlineKeyboardMarkup(rows)
 
+def kb_ad():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Tonton Iklan", url=MONETAG_URL)],
+        [InlineKeyboardButton("✅ Sudah Tonton, Klaim!", callback_data="claim_ad_reward")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="view_status")],
+    ])
+
 async def safe_edit(query, text, keyboard=None):
     try:
         await query.edit_message_text(text, parse_mode="HTML",
@@ -967,7 +996,8 @@ async def start(update, context):
         f"⚔️ <b>Selamat datang, Hunter {esc(name)}!</b>\n\n"
         "Naikkan rank <b>F</b> → <b>SSS</b>!\n"
         "Makin tinggi level, makin banyak quest/hari! 🎴\n\n"
-        "⭐ Ada <b>Shop</b> pakai Telegram Stars!\n\n"
+        "⭐ Ada <b>Shop</b> pakai Telegram Stars!\n"
+        "🎬 Tonton iklan buat bonus EXP gratis!\n\n"
         "📌 Mulai dari /quest atau /status"
     )
     if msgs: welcome = "\n\n".join(msgs) + "\n\n" + welcome
@@ -989,6 +1019,8 @@ async def help_cmd(update, context):
         "⭐ <b>SHOP</b>\n"
         "/shop — Buka shop Stars\n"
         "/inventory — Lihat inventory\n\n"
+        "🎬 <b>IKLAN</b>\n"
+        "/ads — Tonton iklan, dapat +EXP gratis\n\n"
         "🐉 <b>BOSS RAID</b>\n"
         "/boss — Info boss (cooldown 1x/hari)\n"
         "/attack — Serang boss\n\n"
@@ -1191,6 +1223,30 @@ async def inventory_cmd(update, context):
         lines.append("<i>Inventory masih kosong.</i>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML",
                                      reply_markup=kb_shop_main())
+
+async def ads_cmd(update, context):
+    uid = update.effective_user.id
+    if not get_user(uid):
+        await update.message.reply_text("Ketik /start dulu."); return
+    can_claim, msg = check_ad_reward(uid)
+    total = get_total_ads(uid)
+    if not can_claim:
+        await update.message.reply_text(
+            f"📺 <b>TONTON IKLAN</b>\n\n{msg}\n\n"
+            f"💰 Total iklan ditonton: <b>{total}x</b>",
+            parse_mode="HTML", reply_markup=kb_back())
+        return
+    text = (
+        "📺 <b>TONTON IKLAN — DAPAT EXP GRATIS!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 Reward: <b>+{AD_REWARD_EXP} EXP</b>\n"
+        f"💰 Total iklan kamu: <b>{total}x</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👇 Tap tombol <b>▶️ Tonton Iklan</b> di bawah.\n"
+        "Setelah selesai, balik ke bot dan tap <b>✅ Klaim</b>.\n\n"
+        "<i>Batas: 1x per hari</i>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb_ad())
   # ================== MAIN CALLBACKS ==================
 async def callback_handler(update, context):
     query = update.callback_query
@@ -1294,6 +1350,27 @@ async def callback_handler(update, context):
             msg += format_badge_msg(check_badges(uid, get_user(uid)))
         await safe_edit(query, msg, kb_after_complete()); return
 
+    if data == "watch_ad":
+        can_claim, msg = check_ad_reward(uid)
+        if not can_claim:
+            await query.answer(msg, show_alert=True); return
+        total = get_total_ads(uid)
+        ad_text = (
+            "📺 <b>TONTON IKLAN — DAPAT EXP GRATIS!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Reward: <b>+{AD_REWARD_EXP} EXP</b>\n"
+            f"💰 Total iklan kamu: <b>{total}x</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "👇 Tap <b>▶️ Tonton Iklan</b> di bawah.\n"
+            "Setelah selesai, balik & tap <b>✅ Klaim</b>.\n\n"
+            "<i>Batas: 1x per hari</i>"
+        )
+        await safe_edit(query, ad_text, kb_ad()); return
+
+    if data == "claim_ad_reward":
+        reward_msg = give_ad_reward(uid)
+        await safe_edit(query, reward_msg, kb_after_complete()); return
+
     if data == "do_reset":
         reset_user(uid)
         await safe_edit(query,
@@ -1394,6 +1471,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("shop", shop_cmd))
     app.add_handler(CommandHandler("inventory", inventory_cmd))
+    app.add_handler(CommandHandler("ads", ads_cmd))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^shop_"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy_"))
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -1412,6 +1490,7 @@ def main():
             BotCommand("badges", "Koleksi badge"),
             BotCommand("shop", "Buka shop Stars"),
             BotCommand("inventory", "Lihat inventory"),
+            BotCommand("ads", "Tonton iklan, dapat EXP"),
             BotCommand("boss", "Info weekly boss"),
             BotCommand("attack", "Serang boss (1x/hari)"),
             BotCommand("reset", "Reset progress (hati-hati!)"),
